@@ -86,16 +86,17 @@ def get_num_transfer_tokens(block_mask_index: torch.Tensor, steps: int) -> torch
 def generate(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
              remasking='low_confidence', mask_id=126336, threshold=None, factor=None):
     '''
+    기본 샘플링 함수 (원본 동작 유지).
+
     Args:
         model: Mask predictor.
-        prompt: A tensor of shape (1, L).
+        prompt: A tensor of shape (B, L_prompt).
         steps: Sampling steps, less than or equal to gen_length.
         gen_length: Generated answer length.
         block_length: Block length, less than or equal to gen_length. If less than gen_length, it means using semi_autoregressive remasking.
         temperature: Categorical distribution sampling temperature.
-        cfg_scale: Unsupervised classifier-free guidance scale.
         remasking: Remasking strategy. 'low_confidence' or 'random'.
-        mask_id: The toke id of [MASK] is 126336.
+        mask_id: The token id of [MASK] (LLaDA는 126336).
     '''
     x = torch.full((prompt.shape[0], prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
     x[:, :prompt.shape[1]] = prompt.clone()
@@ -104,29 +105,283 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
     num_blocks = gen_length // block_length
 
     assert steps % num_blocks == 0
-    steps = steps // num_blocks
+    steps_per_block = steps // num_blocks
 
     nfe = 0
     for num_block in range(num_blocks):
-        block_mask_index = (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length] == mask_id)
-        num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
+        block_mask_index = (
+            x[:, prompt.shape[1] + num_block * block_length : prompt.shape[1] + (num_block + 1) * block_length]
+            == mask_id
+        )
+        num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps_per_block)
         i = 0
         while True:
             nfe += 1
             mask_index = (x == mask_id)
             logits = model(x).logits
-            mask_index[:, prompt.shape[1] + (num_block + 1) * block_length:] = 0
+            # 이후 블록은 이번 블록에서 고려하지 않도록 마스킹
+            mask_index[:, prompt.shape[1] + (num_block + 1) * block_length :] = 0
             if factor is None:
-                x0, transfer_index = get_transfer_index(logits, temperature, remasking, mask_index, x, num_transfer_tokens[:, i] if threshold is None else None, threshold)
+                x0, transfer_index = get_transfer_index(
+                    logits,
+                    temperature,
+                    remasking,
+                    mask_index,
+                    x,
+                    num_transfer_tokens[:, i] if threshold is None else None,
+                    threshold,
+                )
             else:
-                x0, transfer_index = get_transfer_index_dynamic(logits, temperature, remasking, mask_index, x, None, factor)
+                x0, transfer_index = get_transfer_index_dynamic(
+                    logits, temperature, remasking, mask_index, x, None, factor
+                )
             x[transfer_index] = x0[transfer_index]
             i += 1
-            if (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length] == mask_id).sum() == 0:
+            if (
+                x[
+                    :,
+                    prompt.shape[1] + num_block * block_length : prompt.shape[1] + (num_block + 1) * block_length,
+                ]
+                == mask_id
+            ).sum() == 0:
                 break
     return x, nfe
 
 
+@ torch.no_grad()
+def generate_with_tracking(
+    model,
+    prompt,
+    steps=128,
+    gen_length=128,
+    block_length=128,
+    temperature=0.0,
+    remasking="low_confidence",
+    mask_id=126336,
+    threshold=None,
+    factor=None,
+):
+    """
+    Diffusion 과정에서 어떤 토큰이 언제/무엇으로 unmask 되었는지 추적하는 버전.
+
+    반환:
+        x: 최종 시퀀스 (B, L_prompt + gen_length)
+        nfe: 모델 호출 횟수
+        history: 각 step별 상태 로그 (리스트 길이 = 총 step 수)
+        first_unmask_step: (B, L) long, 각 위치가 처음 unmask 된 step index (아직 mask면 -1)
+        unmasked_token_id: (B, L) long, 처음 unmask 될 때 채워진 token id (mask 그대로면 mask_id)
+    """
+    device = model.device
+    B = prompt.shape[0]
+    prompt_len = prompt.shape[1]
+
+    # 전체 시퀀스 초기화 (프롬프트 + 마스크된 응답 구간)
+    x = torch.full((B, prompt_len + gen_length), mask_id, dtype=torch.long, device=device)
+    x[:, :prompt_len] = prompt.clone()
+
+    assert gen_length % block_length == 0
+    num_blocks = gen_length // block_length
+
+    assert steps % num_blocks == 0
+    steps_per_block = steps // num_blocks
+
+    # tracking용 텐서들
+    total_len = x.shape[1]
+    first_unmask_step = torch.full(
+        (B, total_len), -1, dtype=torch.long, device=device
+    )  # 아직 unmask 안 된 위치는 -1
+    unmasked_token_id = torch.full(
+        (B, total_len), mask_id, dtype=torch.long, device=device
+    )  # 기본값은 mask_id
+
+    history = []  # 각 step별 로그
+    nfe = 0
+    global_step_idx = 0  # 블록 전체를 통틀어 증가하는 step index
+
+    for num_block in range(num_blocks):
+        block_start = prompt_len + num_block * block_length
+        block_end = prompt_len + (num_block + 1) * block_length
+
+        block_mask_index = (x[:, block_start:block_end] == mask_id)
+        num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps_per_block)
+
+        i = 0
+        while True:
+            nfe += 1
+            mask_index = (x == mask_id)
+
+            logits = model(x).logits
+
+            # 이후 블록은 이번 블록에서 고려하지 않도록 마스킹
+            mask_index[:, prompt_len + (num_block + 1) * block_length :] = 0
+
+            if factor is None:
+                x0, transfer_index = get_transfer_index(
+                    logits,
+                    temperature,
+                    remasking,
+                    mask_index,
+                    x,
+                    num_transfer_tokens[:, i] if threshold is None else None,
+                    threshold,
+                )
+            else:
+                x0, transfer_index = get_transfer_index_dynamic(
+                    logits, temperature, remasking, mask_index, x, None, factor
+                )
+
+            # 이번 step에서 "새롭게" unmask 되는 위치들 (이전에 mask였던 곳만)
+            newly_unmasked = transfer_index & (x == mask_id)
+
+            # 처음 unmask 되는 step index와 token id 기록
+            first_unmask_step[newly_unmasked] = global_step_idx
+            unmasked_token_id[newly_unmasked] = x0[newly_unmasked]
+
+            # 실제로 시퀀스 업데이트
+            x[transfer_index] = x0[transfer_index]
+
+            # 시각화/분석용 로그 저장 (CPU로 옮겨서 메모리 부담 완화)
+            history.append(
+                {
+                    "step": int(global_step_idx),
+                    "x": x.detach().cpu().clone(),  # (B, L)
+                    "mask_index": (x == mask_id).detach().cpu().clone(),  # (B, L) bool
+                    "transfer_index": transfer_index.detach().cpu().clone(),  # (B, L) bool
+                }
+            )
+
+            global_step_idx += 1
+            i += 1
+
+            # 현재 블록 내에서 더 이상 mask가 없으면 종료
+            if (x[:, block_start:block_end] == mask_id).sum() == 0:
+                break
+
+    return x, nfe, history, first_unmask_step.detach().cpu(), unmasked_token_id.detach().cpu()
+
+def get_transfer_index(
+    logits: torch.Tensor,
+    temperature: float,
+    remasking: str,
+    mask_index: torch.Tensor,   # (B, L) bool
+    x: torch.Tensor,            # (B, L) long
+    num_transfer_tokens,        # (B,) or (B,1) long tensor, or None when threshold is used
+    threshold: float = None,
+):
+    """
+    Returns:
+        x0: (B, L) long — proposed tokens
+        transfer_index: (B, L) bool — which positions to update this step
+    """
+    # 1) Sample proposal x0
+    # Gumbel-noise for exploration; if temperature==0, add_gumbel_noise should no-op
+    logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+    x0 = torch.argmax(logits_with_noise, dim=-1)  # (B, L), long
+
+    # 2) Confidence for chosen tokens (or random)
+    if remasking == "low_confidence":
+        # Use higher precision for softmax stability
+        p = F.softmax(logits.to(torch.float64), dim=-1)
+        x0_p = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)  # (B, L), float64
+    elif remasking == "random":
+        x0_p = torch.rand(x0.shape, device=x0.device, dtype=torch.float64)  # (B, L)
+    else:
+        raise NotImplementedError(remasking)
+
+    # Only modify masked spots; keep others as original x and set their confidence to -inf
+    x0 = torch.where(mask_index, x0, x)
+
+    neg_inf = torch.tensor(torch.finfo(x0_p.dtype).min, device=x0_p.device, dtype=x0_p.dtype)
+    confidence = torch.where(mask_index, x0_p, neg_inf)  # (B, L)
+
+    # 3) Pick positions to transfer (vectorized)
+    if threshold is not None:
+        # Transfer all masked positions whose confidence >= threshold
+        # (No top-k; purely threshold-based)
+        transfer_index = mask_index & (confidence >= threshold)
+
+        # at least one token is transferred "always unmask max c^i"
+        max_conf_indices = torch.argmax(confidence, dim=1, keepdim=True) # (B, 1)
+        force_mask = torch.zeros_like(transfer_index).scatter_(1, max_conf_indices, True)
+
+        # (Above Threshold) OR (Is Max Confidence)
+        transfer_index = transfer_index | force_mask
+
+        # Safety: do not unmask something that was not masked (consider fully unmasked rows)
+        transfer_index = transfer_index & mask_index
+
+        return x0, transfer_index
+
+    # Else: per-row top-k with varying k (num_transfer_tokens), fully batched
+    if num_transfer_tokens is None:
+        raise ValueError("num_transfer_tokens must be a tensor when threshold is None.")
+
+    # Ensure shape (B,) long
+    if num_transfer_tokens.dim() == 2 and num_transfer_tokens.size(1) == 1:
+        num_transfer_tokens = num_transfer_tokens.squeeze(1)
+    num_transfer_tokens = num_transfer_tokens.to(dtype=torch.long, device=confidence.device)
+    num_transfer_tokens = torch.clamp(num_transfer_tokens, min=0)
+
+    # Sort confidences descending (masked positions are valid; others are -inf)
+    # idx: (B, L) gives positions in original sequence sorted by confidence
+    values, idx = torch.sort(confidence, dim=1, descending=True)
+
+    B, L = confidence.shape
+    # Build a mask that is True for the first k[b] columns in each row (sorted order)
+    cols = torch.arange(L, device=confidence.device).unsqueeze(0).expand(B, L)   # (B, L)
+    k_expanded = num_transfer_tokens.unsqueeze(1).expand(B, L)                   # (B, L)
+    select_sorted = cols < k_expanded                                            # (B, L) bool
+
+    # Scatter the sorted True/False back to original column order
+    # Use integer scatter then cast to bool (scatter_ on bool can be finicky across versions)
+    transfer_int = torch.zeros(B, L, device=confidence.device, dtype=torch.int8) # (B, L)
+    transfer_int = transfer_int.scatter(1, idx, select_sorted.to(torch.int8))
+    transfer_index = transfer_int.bool() & mask_index  # ensure we never select unmasked
+
+    return x0, transfer_index
+
+def get_transfer_index_dynamic(logits, temperature, remasking, mask_index, x, num_transfer_tokens, factor=1):
+    logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+    x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
+    if remasking == 'low_confidence':
+        p = F.softmax(logits.to(torch.float64), dim=-1)
+        x0_p = torch.squeeze(
+            torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1) # b, l
+    elif remasking == 'random':
+        x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
+    else:
+        raise NotImplementedError(remasking)
+    
+    x0 = torch.where(mask_index, x0, x)
+    confidence = torch.where(mask_index, x0_p, -np.inf)
+
+    transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
+    num_transfer_tokens = mask_index.sum(dim=1, keepdim=True)
+    
+    for j in range(confidence.shape[0]):
+        num_tokens = int(num_transfer_tokens[j].item())
+        if num_tokens == 0:
+            continue
+        
+        ns=list(range(1,num_transfer_tokens[j]+1))
+        es=[factor/(n+1) for n in ns]
+        threshs=[1-e for e in es]
+
+        # at least one token is transferred
+        threshs[0]=-1
+        sorted_confidence=torch.sort(confidence[j][mask_index[j]],dim=-1,descending=True)[0]
+        assert len(sorted_confidence)==len(threshs)
+        for top_i in range(len(threshs)):
+            if sorted_confidence[top_i]<threshs[top_i]:
+                break
+
+        if top_i == 0 or top_i == len(threshs)-1:
+            top_i+=1
+
+        _, select_index = torch.topk(confidence[j], k=top_i)
+        transfer_index[j, select_index] = True
+
+    return x0, transfer_index
 
 @ torch.no_grad()
 def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
@@ -294,131 +549,6 @@ def generate_with_dual_cache(
     return x, nfe
 
 
-
-def get_transfer_index(
-    logits: torch.Tensor,
-    temperature: float,
-    remasking: str,
-    mask_index: torch.Tensor,   # (B, L) bool
-    x: torch.Tensor,            # (B, L) long
-    num_transfer_tokens,        # (B,) or (B,1) long tensor, or None when threshold is used
-    threshold: float = None,
-):
-    """
-    Returns:
-        x0: (B, L) long — proposed tokens
-        transfer_index: (B, L) bool — which positions to update this step
-    """
-    # 1) Sample proposal x0
-    # Gumbel-noise for exploration; if temperature==0, add_gumbel_noise should no-op
-    logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
-    x0 = torch.argmax(logits_with_noise, dim=-1)  # (B, L), long
-
-    # 2) Confidence for chosen tokens (or random)
-    if remasking == "low_confidence":
-        # Use higher precision for softmax stability
-        p = F.softmax(logits.to(torch.float64), dim=-1)
-        x0_p = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)  # (B, L), float64
-    elif remasking == "random":
-        x0_p = torch.rand(x0.shape, device=x0.device, dtype=torch.float64)  # (B, L)
-    else:
-        raise NotImplementedError(remasking)
-
-    # Only modify masked spots; keep others as original x and set their confidence to -inf
-    x0 = torch.where(mask_index, x0, x)
-
-    neg_inf = torch.tensor(torch.finfo(x0_p.dtype).min, device=x0_p.device, dtype=x0_p.dtype)
-    confidence = torch.where(mask_index, x0_p, neg_inf)  # (B, L)
-
-    # 3) Pick positions to transfer (vectorized)
-    if threshold is not None:
-        # Transfer all masked positions whose confidence >= threshold
-        # (No top-k; purely threshold-based)
-        transfer_index = mask_index & (confidence >= threshold)
-
-        # at least one token is transferred "always unmask max c^i"
-        max_conf_indices = torch.argmax(confidence, dim=1, keepdim=True) # (B, 1)
-        force_mask = torch.zeros_like(transfer_index).scatter_(1, max_conf_indices, True)
-
-        # (Above Threshold) OR (Is Max Confidence)
-        transfer_index = transfer_index | force_mask
-
-        # Safety: do not unmask something that was not masked (consider fully unmasked rows)
-        transfer_index = transfer_index & mask_index
-
-        return x0, transfer_index
-
-    # Else: per-row top-k with varying k (num_transfer_tokens), fully batched
-    if num_transfer_tokens is None:
-        raise ValueError("num_transfer_tokens must be a tensor when threshold is None.")
-
-    # Ensure shape (B,) long
-    if num_transfer_tokens.dim() == 2 and num_transfer_tokens.size(1) == 1:
-        num_transfer_tokens = num_transfer_tokens.squeeze(1)
-    num_transfer_tokens = num_transfer_tokens.to(dtype=torch.long, device=confidence.device)
-    num_transfer_tokens = torch.clamp(num_transfer_tokens, min=0)
-
-    # Sort confidences descending (masked positions are valid; others are -inf)
-    # idx: (B, L) gives positions in original sequence sorted by confidence
-    values, idx = torch.sort(confidence, dim=1, descending=True)
-
-    B, L = confidence.shape
-    # Build a mask that is True for the first k[b] columns in each row (sorted order)
-    cols = torch.arange(L, device=confidence.device).unsqueeze(0).expand(B, L)   # (B, L)
-    k_expanded = num_transfer_tokens.unsqueeze(1).expand(B, L)                   # (B, L)
-    select_sorted = cols < k_expanded                                            # (B, L) bool
-
-    # Scatter the sorted True/False back to original column order
-    # Use integer scatter then cast to bool (scatter_ on bool can be finicky across versions)
-    transfer_int = torch.zeros(B, L, device=confidence.device, dtype=torch.int8) # (B, L)
-    transfer_int = transfer_int.scatter(1, idx, select_sorted.to(torch.int8))
-    transfer_index = transfer_int.bool() & mask_index  # ensure we never select unmasked
-
-    return x0, transfer_index
-
-def get_transfer_index_dynamic(logits, temperature, remasking, mask_index, x, num_transfer_tokens, factor=1):
-    logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
-    x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
-    if remasking == 'low_confidence':
-        p = F.softmax(logits.to(torch.float64), dim=-1)
-        x0_p = torch.squeeze(
-            torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1) # b, l
-    elif remasking == 'random':
-        x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
-    else:
-        raise NotImplementedError(remasking)
-    
-    x0 = torch.where(mask_index, x0, x)
-    confidence = torch.where(mask_index, x0_p, -np.inf)
-
-    transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
-    num_transfer_tokens = mask_index.sum(dim=1, keepdim=True)
-    
-    for j in range(confidence.shape[0]):
-        num_tokens = int(num_transfer_tokens[j].item())
-        if num_tokens == 0:
-            continue
-        
-        ns=list(range(1,num_transfer_tokens[j]+1))
-        es=[factor/(n+1) for n in ns]
-        threshs=[1-e for e in es]
-
-        # at least one token is transferred
-        threshs[0]=-1
-        sorted_confidence=torch.sort(confidence[j][mask_index[j]],dim=-1,descending=True)[0]
-        assert len(sorted_confidence)==len(threshs)
-        for top_i in range(len(threshs)):
-            if sorted_confidence[top_i]<threshs[top_i]:
-                break
-
-        if top_i == 0 or top_i == len(threshs)-1:
-            top_i+=1
-
-        _, select_index = torch.topk(confidence[j], k=top_i)
-        transfer_index[j, select_index] = True
-
-    return x0, transfer_index
-
 def main():
     device = 'cuda'
 
@@ -438,7 +568,7 @@ def main():
     with torch.inference_mode():
         nvtx.range_push("INFER")
 
-        out = generate_with_dual_cache(model, input_ids, steps=128, gen_length=128, block_length=32, temperature=0., remasking='low_confidence')
+        out = generate(model, input_ids, steps=128, gen_length=128, block_length=128, temperature=0., remasking='low_confidence')
     
         torch.cuda.synchronize()
         nvtx.range_pop()

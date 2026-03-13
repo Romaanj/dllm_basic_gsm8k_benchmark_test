@@ -35,6 +35,89 @@ from transformers.utils import (
 
 logger = logging.get_logger(__name__)
 
+def _to_bool(v) -> bool:
+    if isinstance(v, bool):
+        return v
+    return str(v).lower() in {"1", "true", "yes", "y"}
+
+
+def get_depth_adaptive_rollout(
+    attentions,
+    rollout_mode: str = "sigmoid",
+) -> Optional[torch.Tensor]:
+    if attentions is None or len(attentions) == 0:
+        return None
+
+    with torch.no_grad():
+        if attentions[0] is None:
+            return None
+        if attentions[0].dim() == 4:
+            avg_attn = [a.mean(dim=1) for a in attentions]
+        else:
+            avg_attn = list(attentions)
+
+        num_layers = len(avg_attn)
+        residualized = []
+        invert_depth = rollout_mode == "sigmoid_inverted"
+        for i, a in enumerate(avg_attn):
+            identity = torch.eye(a.size(-1), device=a.device, dtype=a.dtype)
+            if rollout_mode in ("sigmoid", "sigmoid_inverted"):
+                slope = 0.5
+                mid = num_layers / 2
+                depth_arg = (mid - i) if invert_depth else (i - mid)
+                alpha = 0.5 * torch.sigmoid(
+                    torch.tensor(slope * depth_arg, device=a.device, dtype=a.dtype)
+                )
+                residualized.append((1.0 - alpha) * identity + alpha * a)
+            else:
+                residualized.append(0.5 * identity + 0.5 * a)
+
+        rollout = residualized[0]
+        for i in range(1, len(residualized)):
+            rollout = torch.matmul(residualized[i], rollout)
+        return rollout[0].sum(dim=0)
+
+
+def hybrid_cdf_chunking(
+    gen_scores: torch.Tensor,
+    num_blocks: int,
+    lam: float = 1.0,
+    inverse: bool = True,
+):
+    gen_length = gen_scores.numel()
+    if gen_length <= 0 or num_blocks <= 0 or num_blocks > gen_length:
+        return [(0, gen_length)]
+
+    scores = gen_scores.detach().cpu().to(torch.float64).clamp(min=0)
+    total_mass = scores.sum().item()
+    if total_mass < 1e-12:
+        boundaries = torch.linspace(0, gen_length, steps=num_blocks + 1).round().to(torch.long).tolist()
+        boundaries[0], boundaries[-1] = 0, gen_length
+        boundaries = sorted(set(boundaries))
+        return [(boundaries[i], boundaries[i + 1]) for i in range(len(boundaries) - 1)]
+
+    if inverse:
+        inv_scores = 1.0 / (scores + 1e-10)
+        attn_cdf = torch.cumsum(inv_scores, dim=0) / inv_scores.sum()
+    else:
+        attn_cdf = torch.cumsum(scores, dim=0) / total_mass
+    uniform_cdf = torch.arange(1, gen_length + 1, dtype=torch.float64) / gen_length
+    hybrid_cdf = lam * attn_cdf + (1.0 - lam) * uniform_cdf
+
+    boundaries = [0]
+    for k in range(1, num_blocks):
+        threshold = k / num_blocks
+        candidates = torch.where(hybrid_cdf >= threshold)[0]
+        boundary = candidates[0].item() + 1 if candidates.numel() > 0 else gen_length
+        if boundary >= gen_length:
+            break
+        boundaries.append(boundary)
+    if boundaries[-1] != gen_length:
+        boundaries.append(gen_length)
+    boundaries = sorted(set(boundaries))
+    return [(boundaries[i], boundaries[i + 1]) for i in range(len(boundaries) - 1)]
+
+
 def get_num_transfer_tokens(mask_index, steps):
     '''
     In the reverse process, the interval [0, 1] is uniformly discretized into steps intervals.
@@ -373,6 +456,12 @@ class DreamGenerationMixin:
         threshold = kwargs.get("threshold", 0.9)
         block_length = kwargs.get("block_length", 32)
         dual_cache = kwargs.get("dual_cache", False)
+        kv_cache = kwargs.get("kv_cache", True)
+        num_blocks = kwargs.get("num_blocks", None)
+        lam = kwargs.get("lam", 1.0)
+        inverse_cdf = kwargs.get("inverse_cdf", False)
+        rollout_mode = kwargs.get("rollout_mode", "sigmoid")
+        steps_per_block = kwargs.get("steps_per_block", None)
 
         result = self._sample(
             input_ids,
@@ -380,7 +469,13 @@ class DreamGenerationMixin:
             generation_config=generation_config,
             threshold=threshold,
             block_length=block_length,
-            dual_cache=dual_cache
+            dual_cache=dual_cache,
+            kv_cache=kv_cache,
+            num_blocks=num_blocks,
+            lam=lam,
+            inverse_cdf=inverse_cdf,
+            rollout_mode=rollout_mode,
+            steps_per_block=steps_per_block,
         )
         return result
 
@@ -392,6 +487,12 @@ class DreamGenerationMixin:
         threshold: Optional[float] = 0.9,
         block_length: Optional[int] = 32,
         dual_cache: bool = False,
+        kv_cache: bool = True,
+        num_blocks: Optional[int] = None,
+        lam: float = 1.0,
+        inverse_cdf: bool = False,
+        rollout_mode: str = "sigmoid",
+        steps_per_block: Optional[int] = None,
     ) -> Union[DreamModelOutput, torch.LongTensor]:
         # init values
         
@@ -405,23 +506,16 @@ class DreamGenerationMixin:
         top_k = generation_config.top_k
         alg = generation_config.alg
         alg_temp = generation_config.alg_temp
+        kv_cache = _to_bool(kv_cache)
+        if not kv_cache:
+            dual_cache = False
 
         histories = [] if (return_dict_in_generate and output_history) else None
 
         # pad input_ids to max_length
         x = F.pad(input_ids, (0, max_length - input_ids.shape[1]), value=mask_token_id)
         gen_length = max_length - input_ids.shape[1]
-        
-        # Handle block configuration
-        if block_length is None:
-            block_length = gen_length  # Default: single block (original behavior)
-        
-        assert gen_length % block_length == 0, f"gen_length ({gen_length}) must be divisible by block_length ({block_length})"
-        num_blocks = gen_length // block_length
-        
-        assert steps % num_blocks == 0, f"steps ({steps}) must be divisible by num_blocks ({num_blocks})"
-        steps_per_block = steps // num_blocks
-        timesteps = torch.linspace(1, generation_config.eps, steps_per_block + 1, device=x.device)
+        prompt_len = input_ids.shape[1]
 
         if attention_mask is not None and torch.any(attention_mask == 0.0):
             # we do not mask the [MASK] tokens so value = 1.0
@@ -438,61 +532,147 @@ class DreamGenerationMixin:
             tok_idx = None
             attention_mask = "full"
 
+        # Handle block configuration
+        if generation_config.alg == "hybrid_inverse_cdf":
+            if num_blocks is None:
+                if block_length is None:
+                    block_length = 32
+                assert gen_length % block_length == 0, (
+                    f"gen_length ({gen_length}) must be divisible by block_length ({block_length})"
+                )
+                num_blocks = gen_length // block_length
+            else:
+                num_blocks = int(num_blocks)
+
+            rollout_scores = None
+            rollout_attention_mask = None if attention_mask == "full" else attention_mask
+            model_output = self(
+                x,
+                rollout_attention_mask,
+                tok_idx,
+                output_attentions=True,
+                use_cache=False,
+            )
+            if hasattr(model_output, "attentions"):
+                rollout_scores = get_depth_adaptive_rollout(
+                    model_output.attentions, rollout_mode=rollout_mode
+                )
+
+            if rollout_scores is not None:
+                gen_scores = rollout_scores.to(torch.float64)[prompt_len:prompt_len + gen_length]
+                blocks = hybrid_cdf_chunking(
+                    gen_scores=gen_scores,
+                    num_blocks=num_blocks,
+                    lam=float(lam),
+                    inverse=_to_bool(inverse_cdf),
+                )
+            else:
+                # fallback: uniform blocks
+                boundaries = torch.linspace(0, gen_length, steps=num_blocks + 1).round().to(torch.long).tolist()
+                boundaries[0], boundaries[-1] = 0, gen_length
+                boundaries = sorted(set(boundaries))
+                blocks = [(boundaries[i], boundaries[i + 1]) for i in range(len(boundaries) - 1)]
+        else:
+            if block_length is None:
+                block_length = gen_length
+            assert gen_length % block_length == 0, (
+                f"gen_length ({gen_length}) must be divisible by block_length ({block_length})"
+            )
+            num_blocks = gen_length // block_length
+            blocks = [
+                (i * block_length, (i + 1) * block_length)
+                for i in range(num_blocks)
+            ]
+
+        if steps_per_block is None:
+            assert steps % num_blocks == 0, (
+                f"steps ({steps}) must be divisible by num_blocks ({num_blocks})"
+            )
+            steps_per_block = steps // num_blocks
+        else:
+            steps_per_block = int(steps_per_block)
+            assert steps_per_block > 0, "steps_per_block must be positive"
+
+        timesteps = torch.linspace(1, generation_config.eps, steps_per_block + 1, device=x.device)
+
         # Initialize cache for the prompt
         past_key_values = None
 
         # Process each block
-        for num_block in range(num_blocks):
-            
-            current_block_start = input_ids.shape[1] + num_block * block_length
-            current_block_end = current_block_start + block_length
+        for block_start_rel, block_end_rel in blocks:
+            current_block_start = prompt_len + block_start_rel
+            current_block_end = prompt_len + block_end_rel
+            current_block_length = current_block_end - current_block_start
 
-            # update cache
-            model_output = self(x, attention_mask, tok_idx, use_cache=True)
-            past_key_values = model_output.past_key_values
-            logits = model_output.logits
-            logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
-            confidence, x0 = sample_tokens(logits, temperature=temperature, top_p=top_p, top_k=top_k)
-            x[:, current_block_start] = x0[:, current_block_start]
-            
-            # Extract only previous block cache
-            if not dual_cache:
-                new_past_key_values = []
-                for i in range(len(past_key_values)):
-                    new_past_key_values.append(())
-                    for j in range(len(past_key_values[i])):
-                        new_past_key_values[i] += (past_key_values[i][j][:, :current_block_start, :],)
-                past_key_values = new_past_key_values
-            else:
-                replace_position = torch.zeros_like(x, dtype=torch.bool)
-                replace_position[:, current_block_start:current_block_end] = 1
+            if kv_cache:
+                # update cache
+                model_output = self(x, attention_mask, tok_idx, use_cache=True)
+                past_key_values = model_output.past_key_values
+                logits = model_output.logits
+                logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
+                confidence, x0 = sample_tokens(logits, temperature=temperature, top_p=top_p, top_k=top_k)
+                x[:, current_block_start] = x0[:, current_block_start]
+
+                # Extract only previous block cache
+                if not dual_cache:
+                    new_past_key_values = []
+                    for i in range(len(past_key_values)):
+                        new_past_key_values.append(())
+                        for j in range(len(past_key_values[i])):
+                            new_past_key_values[i] += (past_key_values[i][j][:, :current_block_start, :],)
+                    past_key_values = new_past_key_values
+                else:
+                    replace_position = torch.zeros_like(x, dtype=torch.bool)
+                    replace_position[:, current_block_start:current_block_end] = 1
                 
             i = 1
             while True:
-                # Use cache for generation
-                if dual_cache:
-                    mask_index = (x[:, current_block_start:current_block_end] == mask_token_id)
+                if kv_cache:
+                    # Use cache for generation
+                    if dual_cache:
+                        mask_index = (x[:, current_block_start:current_block_end] == mask_token_id)
+                    else:
+                        mask_index = (x[:, current_block_start:] == mask_token_id)
+
+                    # Prepare attention mask for cached generation
+                    if attention_mask != "full":
+                        current_attention_mask = attention_mask[:, :, :, current_block_start:]
+                    else:
+                        current_attention_mask = attention_mask
+
+                    if dual_cache:
+                        model_output = self(
+                            x[:, current_block_start:current_block_end],
+                            current_attention_mask,
+                            tok_idx[:, current_block_start:current_block_end] if tok_idx is not None else None,
+                            past_key_values=past_key_values,
+                            use_cache=True,
+                            dual_cache=dual_cache,
+                            replace_position=replace_position,
+                        )
+                    else:
+                        model_output = self(
+                            x[:, current_block_start:],
+                            current_attention_mask,
+                            tok_idx[:, current_block_start:] if tok_idx is not None else None,
+                            past_key_values=past_key_values,
+                            use_cache=True,
+                        )
                 else:
-                    mask_index = (x[:, current_block_start:] == mask_token_id)
-                
-                # Prepare attention mask for cached generation
-                if attention_mask != "full":
-                    # Adjust attention mask for current position
-                    current_attention_mask = attention_mask[:, :, :, current_block_start:]
-                else:
-                    current_attention_mask = attention_mask
-                
-                if dual_cache:
-                    model_output = self(x[:, current_block_start:current_block_end], current_attention_mask, 
-                                    tok_idx[:, current_block_start:current_block_end] if tok_idx is not None else None, 
-                                    past_key_values=past_key_values, use_cache=True, dual_cache=dual_cache, replace_position=replace_position)
-                else:
-                    model_output = self(x[:, current_block_start:], current_attention_mask, 
-                                    tok_idx[:, current_block_start:] if tok_idx is not None else None, 
-                                    past_key_values=past_key_values, use_cache=True)
+                    # Same block decoding logic without KV cache reuse.
+                    mask_index = (x == mask_token_id)
+                    mask_index[:, :current_block_start] = False
+                    mask_index[:, current_block_end:] = False
+                    full_attention_mask = None if attention_mask == "full" else attention_mask
+                    model_output = self(
+                        x,
+                        full_attention_mask,
+                        tok_idx,
+                        use_cache=False,
+                    )
                 logits = model_output.logits
                 logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
-                if alg == 'confidence_threshold':
+                if alg in {'confidence_threshold', 'hybrid_inverse_cdf'}:
                     mask_logits = logits[mask_index]
                 
                     confidence, x0 = sample_tokens(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k)
@@ -500,13 +680,16 @@ class DreamGenerationMixin:
                     if dual_cache:
                         x_ = torch.zeros_like(x[:, current_block_start:current_block_end], device=self.device, dtype=torch.long) + mask_token_id
                         full_confidence = torch.full_like(x[:, current_block_start:current_block_end], -torch.inf, device=self.device, dtype=logits.dtype)
-                    else:
+                    elif kv_cache:
                         x_ = torch.zeros_like(x[:, current_block_start:], device=self.device, dtype=torch.long) + mask_token_id
                         full_confidence = torch.full_like(x[:, current_block_start:], -torch.inf, device=self.device, dtype=logits.dtype)
+                    else:
+                        x_ = torch.zeros_like(x, device=self.device, dtype=torch.long) + mask_token_id
+                        full_confidence = torch.full_like(x, -torch.inf, device=self.device, dtype=logits.dtype)
                     
                     x_[mask_index] = x0.clone()
                     full_confidence[mask_index] = confidence
-                    full_confidence[:, block_length:] = -torch.inf
+                    full_confidence[:, current_block_length:] = -torch.inf
                     
                     current_transfer_tokens = (x[:, current_block_start:current_block_end] == mask_token_id).sum()
                     
@@ -520,24 +703,28 @@ class DreamGenerationMixin:
                             transfer_index[0, select_index[0, k]] = False
                     if dual_cache:
                         x[:, current_block_start:current_block_end][transfer_index] = x_[transfer_index]
-                    else:
+                    elif kv_cache:
                         x[:, current_block_start:][transfer_index] = x_[transfer_index]
+                    else:
+                        x[transfer_index] = x_[transfer_index]
                 else:
                     if i == steps_per_block:
                         break
                     t = timesteps[i]
                     s = timesteps[i + 1]
-                    mask_index[:, block_length:] = False
+                    mask_index[:, current_block_length:] = False
                     mask_logits = logits[mask_index]
                     confidence, x0 = sample_tokens(mask_logits, temperature, top_p=top_p, top_k=top_k, neg_entropy=True)
                     num_mask_token = mask_index.sum() / mask_index.shape[0]
                     number_transfer_tokens = int(num_mask_token * (1 - s / t)) if i < steps_per_block - 1 else int(num_mask_token)
                     if dual_cache:
                         full_confidence = torch.full_like(x[:, current_block_start:current_block_end], -torch.inf, device=self.device, dtype=logits.dtype)
-                    else:
+                    elif kv_cache:
                         full_confidence = torch.full_like(x[:, current_block_start:], -torch.inf, device=self.device, dtype=logits.dtype)
+                    else:
+                        full_confidence = torch.full_like(x, -torch.inf, device=self.device, dtype=logits.dtype)
                     full_confidence[mask_index] = confidence
-                    full_confidence[:, block_length:] = -torch.inf
+                    full_confidence[:, current_block_length:] = -torch.inf
                     
                     if number_transfer_tokens > 0:
                         if alg_temp is None or alg_temp == 0:
@@ -548,14 +735,18 @@ class DreamGenerationMixin:
                             transfer_index = torch.multinomial(full_confidence, num_samples=number_transfer_tokens)
                         if dual_cache:
                             x_ = torch.zeros_like(x[:, current_block_start:current_block_end], device=self.device, dtype=torch.long) + mask_token_id
-                        else:
+                        elif kv_cache:
                             x_ = torch.zeros_like(x[:, current_block_start:], device=self.device, dtype=torch.long) + mask_token_id
+                        else:
+                            x_ = torch.zeros_like(x, device=self.device, dtype=torch.long) + mask_token_id
                         x_[mask_index] = x0.clone()
                         row_indices = torch.arange(x.size(0), device=self.device).unsqueeze(1).expand_as(transfer_index)
                         if dual_cache:
                             x[:, current_block_start:current_block_end][row_indices,transfer_index] = x_[row_indices,transfer_index]
-                        else:
+                        elif kv_cache:
                             x[:, current_block_start:][row_indices,transfer_index] = x_[row_indices,transfer_index]
+                        else:
+                            x[row_indices,transfer_index] = x_[row_indices,transfer_index]
                     i += 1
 
                 if (x[:, current_block_start:current_block_end] == mask_token_id).sum() == 0:

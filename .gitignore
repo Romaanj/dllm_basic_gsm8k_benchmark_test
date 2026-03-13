@@ -7,3 +7,25 @@ llada/evals_results/
 dream/evals_results/
 .DS_Store
 **/.DS_Store
+
+# 실험 결과
+llada/results_*/
+dream/results_*/
+
+# 생성된 이미지/시각화
+*.png
+*.jpg
+*.jpeg
+*.gif
+vis/
+
+# 체크포인트, 모델 가중치
+*.pt
+*.bin
+*.safetensors
+checkpoints/
+
+# 환경/시크릿
+.env
+.env.*
+*.log

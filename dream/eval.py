@@ -34,7 +34,29 @@ from lm_eval import utils
 from lm_eval.api.instance import Instance
 from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
-from lm_eval.models.utils import get_dtype
+try:
+    from lm_eval.models.utils import get_dtype
+except ImportError:
+    # Compatibility fallback for lm-eval versions that do not expose get_dtype.
+    def get_dtype(dtype):
+        if dtype in (None, "auto"):
+            return None
+        if isinstance(dtype, torch.dtype):
+            return dtype
+        if not isinstance(dtype, str):
+            return None
+        key = dtype.lower()
+        mapping = {
+            "float32": torch.float32,
+            "fp32": torch.float32,
+            "float": torch.float32,
+            "float16": torch.float16,
+            "fp16": torch.float16,
+            "half": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "bf16": torch.bfloat16,
+        }
+        return mapping.get(key, None)
 from lm_eval.__main__ import cli_evaluate
 from model.generation_utils_block import DreamGenerationMixin
 import types
@@ -77,6 +99,12 @@ class Dream(LM):
         apply_chat_template: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         dual_cache: Optional[bool] = False,
+        hybrid_num_blocks: Optional[int] = 8,
+        hybrid_lam: Optional[float] = 1.0,
+        hybrid_inverse_cdf: Optional[bool] = False,
+        hybrid_rollout_mode: Optional[str] = "sigmoid",
+        hybrid_steps_per_block: Optional[int] = None,
+        block_use_kv_cache: Optional[bool] = None,
         save_dir: Optional[str] = None,
         **kwargs,
     ) -> None:
@@ -209,6 +237,30 @@ class Dream(LM):
         self.if_apply_chat_template = apply_chat_template
         self.use_cache = use_cache
         self.dual_cache = dual_cache
+        self.hybrid_num_blocks = (
+            int(hybrid_num_blocks) if hybrid_num_blocks is not None else None
+        )
+        self.hybrid_lam = float(hybrid_lam)
+        self.hybrid_inverse_cdf = (
+            hybrid_inverse_cdf
+            if isinstance(hybrid_inverse_cdf, bool)
+            else str(hybrid_inverse_cdf).lower() == "true"
+        )
+        self.hybrid_rollout_mode = str(hybrid_rollout_mode)
+        self.hybrid_steps_per_block = (
+            int(hybrid_steps_per_block)
+            if hybrid_steps_per_block is not None and str(hybrid_steps_per_block).lower() != "none"
+            else None
+        )
+        self.block_use_kv_cache = (
+            self.use_cache
+            if block_use_kv_cache is None
+            else (
+                block_use_kv_cache
+                if isinstance(block_use_kv_cache, bool)
+                else str(block_use_kv_cache).lower() == "true"
+            )
+        )
         self.generated_token_num = 0
         self.save_dir = save_dir
     @property
@@ -319,6 +371,12 @@ class Dream(LM):
             alg_temp=self.alg_temp,
             threshold=self.threshold,
             dual_cache=self.dual_cache,
+            kv_cache=self.block_use_kv_cache,
+            num_blocks=self.hybrid_num_blocks,
+            lam=self.hybrid_lam,
+            inverse_cdf=self.hybrid_inverse_cdf,
+            rollout_mode=self.hybrid_rollout_mode,
+            steps_per_block=self.hybrid_steps_per_block,
         )
 
         # decode
@@ -336,7 +394,8 @@ class Dream(LM):
 
     def generate_until(self, requests: List[Instance], disable_tqdm: bool = False):
         res = []
-        if self.use_cache:
+        use_block_generation = self.use_cache or self.alg == "hybrid_inverse_cdf"
+        if use_block_generation:
             from model.generation_utils_block import DreamGenerationMixin
             self.model.diffusion_generate = types.MethodType(DreamGenerationMixin.diffusion_generate, self.model)
             self.model._sample = types.MethodType(DreamGenerationMixin._sample, self.model)

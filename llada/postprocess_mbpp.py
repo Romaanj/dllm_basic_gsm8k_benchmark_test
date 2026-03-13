@@ -1,4 +1,5 @@
 # Copyright 2025 NVIDIA CORPORATION & AFFILIATES
+# Copyright 2025 Guanxi Lu, Imperial College London (modifications)
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,10 +15,12 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 # Modified from Dream repos: https://github.com/HKUNLP/Dream
+# Modified by Guanxi Lu, Imperial College London
 
 import evaluate as hf_evaluate
 import os
 import sys
+import re
 from sanitize import sanitize
 
 os.environ["HF_ALLOW_CODE_EVAL"] = "1"
@@ -32,6 +35,12 @@ def pass_at_1(references, predictions):
 
 import json
 
+def extract_function_name(code):
+    """Extract the first function name as entry_point"""
+    match = re.search(r'def\s+(\w+)\s*\(', code)
+    if match:
+        return match.group(1)
+    return None
         
 def read_jsonl(file_path):
     data = []
@@ -45,8 +54,8 @@ data = read_jsonl(file_path)
 
 references = [sample['target'] for sample in data]
 
-predictions = [[sanitize(sample['doc']['prompt'] + "\n" + sample['resps'][0][0].split('```python\n', 1)[-1].split('```')[0], 
-                sample['doc']["entry_point"])] 
+predictions = [[sanitize(sample['doc']['text'] + "\n" + sample['resps'][0][0].split('```python\n', 1)[-1].split('```')[0], 
+                extract_function_name(sample['doc'].get('code', '')))] 
                 for sample in data]
 
 pass_at_1s = [pass_at_1([reference], [prediction]) for reference, prediction in zip(references, predictions)]

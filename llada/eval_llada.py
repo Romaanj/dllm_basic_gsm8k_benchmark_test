@@ -310,13 +310,25 @@ class LLaDAEvalHarness(LM):
             pad_len = []
             for req in batch:
                 question = req.args[0]
-                if self.is_instruct:
+                # HumanEval일 때는 instruct 모델이라도 raw prompt를 그대로 사용
+                # (eval_equal_mass.py와 동일한 전략)
+                is_humaneval = (
+                    hasattr(req, "doc")
+                    and req.doc is not None
+                    and "task_id" in req.doc
+                    and str(req.doc["task_id"]).lower().startswith("humaneval")
+                )
+                use_chat_template = self.is_instruct and not is_humaneval
+
+                if use_chat_template:
                     m = [{"role": "user", "content": question}]
-                    user_input = self.tokenizer.apply_chat_template(m, add_generation_prompt=True, tokenize=False)
-                    input_ids = self.tokenizer(user_input)['input_ids']
+                    user_input = self.tokenizer.apply_chat_template(
+                        m, add_generation_prompt=True, tokenize=False
+                    )
+                    input_ids = self.tokenizer(user_input)["input_ids"]
                 else:
                     user_input = question
-                    input_ids = self.tokenizer(user_input)['input_ids']
+                    input_ids = self.tokenizer(user_input)["input_ids"]
                 batched_input_ids.append(input_ids)
                 max_len = max(max_len, len(input_ids))
                 pad_len.append(max_len - len(input_ids))
