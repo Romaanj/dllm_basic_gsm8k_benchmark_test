@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+
+.DS_Store
+.env
+
+outputs/
+final_results/
+logs/
+results_*/
+
+.claude-octopus/
+autoresearch-state.json
+
+*.log
