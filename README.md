@@ -87,8 +87,20 @@ Argmax1:
 GPU_ID=0 MODEL_PATH=GSAI-ML/LLaDA-8B-Instruct GEN_LENGTH=256 BLOCK_LENGTH=32 SEED=42 bash eval_gsm8k_basic_argmax1.sh
 ```
 
+Manual blocks:
+
+```bash
+GPU_ID=0 \
+MODEL_PATH=GSAI-ML/LLaDA-8B-Instruct \
+GEN_LENGTH=256 \
+MANUAL_BLOCK_SIZES='64|28|28|28|27|27|27|27' \
+SEED=42 \
+bash eval_gsm8k_manual_blocks.sh
+```
+
 ## Notes
 
 - `GEN_LENGTH` must be divisible by `BLOCK_LENGTH` for the suite script.
 - `NUM_BLOCKS` for inverse-CDF is computed as `GEN_LENGTH / BLOCK_LENGTH` in the suite.
+- `MANUAL_BLOCK_SIZES` must sum to `GEN_LENGTH`.
 - These scripts register custom `lm_eval` model names through local Python entrypoints, so run the provided wrappers rather than calling `python -m lm_eval` directly.
